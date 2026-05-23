@@ -559,7 +559,7 @@ class LocalDispatcher(BaseDispatcher):
         command = [
             'docker',
             'run',
-            '-ti',
+            '-i',
             '--rm',
             '-v',
             '/var/run/docker.sock:/var/run/docker.sock',

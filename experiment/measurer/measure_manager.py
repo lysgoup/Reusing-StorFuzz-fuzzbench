@@ -60,7 +60,7 @@ SNAPSHOT_QUEUE_GET_TIMEOUT = 1
 SNAPSHOTS_BATCH_SAVE_SIZE = 100
 MEASUREMENT_LOOP_WAIT = 10
 SATURATION_DONE_COUNT = 96  # 96 사이클(24h) 연속 변화 없음 → saturation 선언
-
+BASE_CYCLES = 96*4 # base_cycles은 saturation_mode일 때 측정 loop에서 필요한 최소 사이클 수를 보장
 
 def _get_saturation_done_path(trial_id: int) -> str:
     """measurer가 plateau 감지 시 생성하는 sentinel 파일 경로를 반환한다.
@@ -102,8 +102,7 @@ def measure_main(experiment_config):
     region_coverage = experiment_config['region_coverage']
     max_cycles = experiment_config.get('max_cycles')
     saturation_mode = experiment_config.get('saturation_mode', False)
-    # base_cycles은 saturation_mode일 때 측정 loop에서 필요한 최소 사이클 수를 보장 current setup : 4 * 96 cycles(4 days)
-    base_cycles = 4 * 96
+    base_cycles = BASE_CYCLES if saturation_mode else None
     measure_manager_loop(experiment, max_total_time, measurers_cpus,
                          region_coverage, max_cycles=max_cycles,
                          saturation_mode=saturation_mode,

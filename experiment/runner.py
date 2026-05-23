@@ -106,7 +106,8 @@ fuzzer_errored_out = False  # pylint:disable=invalid-name
 CORPUS_DIRNAME = 'corpus'
 RESULTS_DIRNAME = 'results'
 CORPUS_ARCHIVE_DIRNAME = 'corpus-archives'
-
+SATURATED_CORPUS_ARCHIVE_NAME = 'saturated_corpus.tar.gz'
+FULL_OUTPUT_ARCHIVE_NAME = 'full_output_final.tar.gz'
 
 def _clean_seed_corpus(seed_corpus_dir):
     """Prepares |seed_corpus_dir| for the trial. This ensures that it can be
@@ -238,6 +239,7 @@ def _signal_fuzz_process(proc, sig):
 
 def _kill_fuzz_process(proc):
     """프로세스 그룹 전체에 SIGINT을 보낸다 (child 포함)."""
+    _fuzzing_stop_event.set()  # [NOTE-fix] 메인 스레드의 sleep을 즉시 중단시킨다
     _signal_fuzz_process(proc, signal.SIGINT)
 
 
@@ -305,8 +307,12 @@ def run_fuzzer(max_total_time, log_filename):
     stop_thread = threading.Thread(target=_stop_watcher, daemon=True)
     stop_thread.start()
 
+    timer_fired = False
     try:
         proc.wait()
+        # [BUG1-fix] proc.wait() 반환 직후, cancel() 호출 전에 타이머 만료 여부를 기록한다.
+        # cancel()은 fired 여부와 무관하게 finished.is_set()=True로 만들어 구분이 불가해진다.
+        timer_fired = kill_timer is not None and not kill_timer.is_alive()
     finally:
         if kill_timer is not None:
             kill_timer.cancel()
@@ -315,9 +321,7 @@ def run_fuzzer(max_total_time, log_filename):
 
     retcode = proc.returncode
     # stop_event 또는 timeout으로 인한 종료는 정상 처리
-    intentional_stop = _fuzzing_stop_event.is_set() or (
-        kill_timer is not None and kill_timer.finished.is_set()
-        and not kill_timer.is_alive())
+    intentional_stop = _fuzzing_stop_event.is_set() or timer_fired
     if retcode and not intentional_stop:
         global fuzzer_errored_out  # pylint:disable=invalid-name
         fuzzer_errored_out = True
@@ -377,6 +381,42 @@ class TrialRunner:  # pylint: disable=too-many-instance-attributes
         # Ensure seeds are in output corpus.
         os.rmdir(self.output_corpus)
         shutil.copytree(input_corpus, self.output_corpus)
+    def archive_and_save_saturated_corpus(self):
+        """saturation 종료 시 전체 queue를 단일 archive로 저장한다."""
+        if not self.gcs_sync_dir:
+            return
+
+        # queue/ 있으면 queue만, 없으면 output_corpus 전체
+        queue_dir = os.path.join(self.output_corpus, 'queue')
+        source_dir = queue_dir if os.path.isdir(queue_dir) else self.output_corpus
+
+        archive_path = os.path.join(self.corpus_archives_dir,
+                                    SATURATED_CORPUS_ARCHIVE_NAME)
+        with tarfile.open(archive_path, 'w:gz') as tar:
+            tar.add(source_dir, arcname='queue')
+
+        gcs_path = posixpath.join(self.gcs_sync_dir, CORPUS_DIRNAME,
+                                SATURATED_CORPUS_ARCHIVE_NAME)
+        filestore_utils.cp(archive_path, gcs_path)
+        os.remove(archive_path)
+        logs.info('[SATURATION] Saved saturated corpus: %s', gcs_path)
+
+    def archive_and_save_full_output(self):
+        """마지막 do_sync 후 output_corpus 전체를 단일 archive로 저장한다.
+        커버리지 측정용이 아닌 분석용 전체 스냅샷이다."""
+        if not self.gcs_sync_dir:
+            return
+
+        archive_path = os.path.join(self.corpus_archives_dir,
+                                    FULL_OUTPUT_ARCHIVE_NAME)
+        with tarfile.open(archive_path, 'w:gz') as tar:
+            tar.add(self.output_corpus, arcname='output')
+
+        gcs_path = posixpath.join(self.gcs_sync_dir, CORPUS_DIRNAME,
+                                  FULL_OUTPUT_ARCHIVE_NAME)
+        filestore_utils.cp(archive_path, gcs_path)
+        os.remove(archive_path)
+        logs.info('[RUNNER] Saved full output archive: %s', gcs_path)
 
     def conduct_trial(self):
         """Conduct the benchmarking trial."""
@@ -404,7 +444,12 @@ class TrialRunner:  # pylint: disable=too-many-instance-attributes
         only_dryrun = bool(environment.get('ONLY_DRYRUN', False))
         if only_dryrun:
             logs.info('[ONLY_DRYRUN] only_dryrun=true: runner will stop after dry run completes.')
-        saturation_mode = bool(environment.get('SATURATION_MODE', False))
+        # [BUG3-fix] bool()은 비어있지 않은 문자열을 True로 평가한다.
+        # ast.literal_eval('false')는 ValueError → 문자열 'false' 반환 → bool('false')=True.
+        # 소문자 포함 모든 표현을 명시적으로 비교해 의도치 않은 활성화를 막는다.
+        _saturation_raw = environment.get('SATURATION_MODE', False)
+        saturation_mode = (_saturation_raw is True or
+                           str(_saturation_raw).lower() in ('true', '1', 'yes'))
         if saturation_mode:
             logs.info('[SATURATION_MODE] saturation_mode=true: hard deadline=%s cycles, runner will enter saturation phase after 384 cycles.', max_cycles)
         # ── cycle 0: dry run 시작 전 seed 상태 측정 ──────────────────────────
@@ -474,11 +519,20 @@ class TrialRunner:  # pylint: disable=too-many-instance-attributes
                     _fuzzing_stop_event.set()
                     break
 
-        fuzz_thread.join()
+        # [BUG2-fix] timeout 없이 join하면 Angora가 SIGINT에 응답하지 않을 때
+        # 무기한 블록되어 runner_done sentinel이 작성되지 않고 measurer가 무한 대기한다.
+        fuzz_thread.join(timeout=120)
+        if fuzz_thread.is_alive():
+            logs.error('[RUNNER] fuzz_thread did not exit within 120s after SIGINT. '
+                       'Proceeding to write runner_done sentinel.')
         self.cycle += 1
         logs.info('[RUNNER] Doing final sync (cycle %d).', self.cycle)
         self.do_sync()
-        
+        self.archive_and_save_full_output()
+
+        if saturation_mode and os.path.exists(saturation_done_path):
+            self.archive_and_save_saturated_corpus()
+            
         # runner 완료 sentinel: scheduler가 이를 감지해 trial.time_ended를 즉시 설정한다.
         runner_done_path = _get_runner_done_path()
         try:
@@ -503,7 +557,9 @@ class TrialRunner:  # pylint: disable=too-many-instance-attributes
         else:
             sleep_time = experiment_utils.get_snapshot_seconds()
         logs.debug('Sleeping for %d seconds.', sleep_time)
-        time.sleep(sleep_time)
+        # [NOTE-fix] kill_timer 만료 시 _fuzzing_stop_event가 set되므로
+        # wait()이 즉시 반환되어 최대 900s 지연을 없앤다.
+        _fuzzing_stop_event.wait(timeout=sleep_time)
         # last_sync_time is recorded before the sync so that each sync happens
         # roughly get_snapshot_seconds() after each other.
         self.last_sync_time = time.time()
@@ -557,9 +613,17 @@ class TrialRunner:  # pylint: disable=too-many-instance-attributes
             self.corpus_archives_dir,
             experiment_utils.get_corpus_archive_name(self.cycle))
 
+        # Allow fuzzer module to specify the subdirectory that holds corpus
+        # files (e.g. Angora stores corpus in queue/ rather than the root).
+        # Fuzzers that do not define get_corpus_dir() get the original behaviour.
+        fuzzer_module = get_fuzzer_module(self.fuzzer)
+        get_corpus_dir_fn = getattr(fuzzer_module, 'get_corpus_dir', None)
+        corpus_dir = (get_corpus_dir_fn(self.output_corpus)
+                      if get_corpus_dir_fn else self.output_corpus)
+
         with tarfile.open(archive, 'w:gz') as tar:
             new_archive_time = self.last_archive_time
-            for file_path in get_corpus_elements(self.output_corpus):
+            for file_path in get_corpus_elements(corpus_dir):
                 try:
                     stat_info = os.stat(file_path)
                     last_modified_time = stat_info.st_mtime
