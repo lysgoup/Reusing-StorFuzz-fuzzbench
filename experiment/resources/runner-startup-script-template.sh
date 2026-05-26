@@ -34,6 +34,8 @@ do
   echo 'Error pulling image, retrying...'
 done{% endif %}
 
+mkdir -p {{experiment_filestore}}/{{experiment}}/logs/{{benchmark}}
+
 docker run \
 --privileged --cpus={{num_cpu_cores}} --rm \
 {% if cpuset %}--cpuset-cpus={{cpuset}} {% endif %} \
@@ -65,4 +67,4 @@ docker run \
 --ulimit core=0 \
 --cap-add SYS_NICE --cap-add SYS_PTRACE \
 --security-opt seccomp=unconfined \
-{{docker_image_url}} 2>&1 | tee /tmp/runner-log-{{trial_id}}.txt
+{{docker_image_url}} 2>&1 | tee {{experiment_filestore}}/{{experiment}}/logs/{{benchmark}}/{{fuzzer}}-runner-log-{{trial_id}}.txt
