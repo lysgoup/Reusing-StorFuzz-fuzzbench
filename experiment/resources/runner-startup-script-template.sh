@@ -62,6 +62,7 @@ docker run \
 -e ONLY_DRYRUN={{only_dryrun}} \
 -e SATURATION_MODE={{saturation_mode}} \
 -e ANALYSIS_MODE={{analysis_mode}} \
+{% if reusing_scan_experiment %}-e REUSING_SCAN_EXPERIMENT={{reusing_scan_experiment}} {% endif %}\
 {% if not local_experiment %}--name=runner-container {% endif %}\
 --shm-size=2g \
 --ulimit core=0 \

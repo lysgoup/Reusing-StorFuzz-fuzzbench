@@ -199,6 +199,10 @@ def read_and_validate_experiment_config(config_filename: str) -> Dict:
             Requirement(False, bool, False, ''),
         'saturation_mode':
             Requirement(False, bool, False, ''),
+        # The experiment whose reusing_scanner trials scanned this corpus; a
+        # reusing fuzzer reads its taint_scan/ from the shared filestore.
+        'reusing_scan_experiment':
+            Requirement(False, str, False, ''),
     }
 
     all_params_valid = _validate_config_parameters(config, config_requirements)

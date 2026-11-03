@@ -832,6 +832,8 @@ def render_startup_script_template(  # pylint: disable=too-many-arguments
         'only_dryrun': experiment_config.get('only_dryrun', False),
         'saturation_mode': experiment_config.get('saturation_mode', False),
         'analysis_mode': experiment_config.get('analysis_mode', False),
+        'reusing_scan_experiment':
+            experiment_config.get('reusing_scan_experiment'),
     }
 
     if not local_experiment:
