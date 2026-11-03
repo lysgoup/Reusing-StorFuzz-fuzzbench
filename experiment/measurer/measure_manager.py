@@ -106,7 +106,10 @@ def measure_main(experiment_config):
     measure_manager_loop(experiment, max_total_time, measurers_cpus,
                          region_coverage, max_cycles=max_cycles,
                          saturation_mode=saturation_mode,
-                         base_cycles=base_cycles)
+                         base_cycles=base_cycles,
+                         runners_cpus=experiment_config.get('runners_cpus'),
+                         runners_cpus_offset=experiment_config.get(
+                             'runners_cpus_offset', 0))
 
     # Clean up resources.
     gc.collect()
@@ -863,8 +866,10 @@ def measure_manager_inner_loop(experiment: str, max_cycle: int, request_queue,
     return True
 
 
-def get_pool_args(measurers_cpus, runners_cpus):
-    """Return pool args based on measurer cpus and runner cpus arguments."""
+def get_pool_args(measurers_cpus, runners_cpus, runners_cpus_offset=0):
+    """Return pool args based on measurer cpus and runner cpus arguments.
+    Measurers take the cores right after the runners' block, which starts at
+    |runners_cpus_offset|."""
     if measurers_cpus is None or runners_cpus is None:
         return ()
 
@@ -872,10 +877,11 @@ def get_pool_args(measurers_cpus, runners_cpus):
     if not local_experiment:
         return (measurers_cpus,)
 
+    first = runners_cpus_offset + runners_cpus
     cores_queue = multiprocessing.Queue()
-    logger.info('Scheduling measurers from core %d to %d.', runners_cpus,
-                runners_cpus + measurers_cpus - 1)
-    for cpu in range(runners_cpus, runners_cpus + measurers_cpus):
+    logger.info('Scheduling measurers from core %d to %d.', first,
+                first + measurers_cpus - 1)
+    for cpu in range(first, first + measurers_cpus):
         cores_queue.put(cpu)
     return (measurers_cpus, _process_init, (cores_queue,))
 
@@ -886,7 +892,9 @@ def measure_manager_loop(experiment: str,
                          region_coverage=False,
                          max_cycles=None,
                          saturation_mode=False,
-                         base_cycles=None):  # pylint: disable=too-many-locals
+                         base_cycles=None,
+                         runners_cpus=None,
+                         runners_cpus_offset=0):  # pylint: disable=too-many-locals
     """Measure manager loop. Creates request and response queues, request
     measurements tasks from workers, retrieve measurement results from response
     queue and writes measured snapshots in database.
@@ -900,7 +908,12 @@ def measure_manager_loop(experiment: str,
         measurers_cpus = multiprocessing.cpu_count()
         logger.info('Number of measurer CPUs not passed as argument. using %d',
                     measurers_cpus)
-    with multiprocessing.Pool() as pool, multiprocessing.Manager() as manager:
+    # Sized and pinned by measurers_cpus, not one worker per host core: on a
+    # local experiment the runners own their cores.
+    pool_args = get_pool_args(measurers_cpus, runners_cpus,
+                              runners_cpus_offset) or (measurers_cpus,)
+    with multiprocessing.Pool(
+            *pool_args) as pool, multiprocessing.Manager() as manager:
         logger.info('Setting up coverage binaries')
         set_up_coverage_binaries(pool, experiment)
         request_queue = manager.Queue()
