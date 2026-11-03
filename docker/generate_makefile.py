@@ -119,6 +119,9 @@ def get_rules_for_image(name, image):
         section += '\tdocker pull ubuntu:focal\n'
     section += '\tdocker build \\\n'
     section += '\t--tag ' + os.path.join(BASE_TAG, image['tag']) + ' \\\n'
+    # Builds size their parallelism by the core count (make -j, compileall
+    # -j0); on a many-core host the default open-file limit runs out.
+    section += '\t--ulimit nofile=1048576:1048576 \\\n'
     section += '\t--build-arg BUILDKIT_INLINE_CACHE=1 \\\n'
     section += ('\t--cache-from ' + os.path.join(BASE_TAG, image['tag']) +
                 ' \\\n')
