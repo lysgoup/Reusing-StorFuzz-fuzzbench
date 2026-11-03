@@ -522,6 +522,11 @@ class LocalDispatcher(BaseDispatcher):
         set_experiment_arg = f'EXPERIMENT={self.config["experiment"]}'
         filestore = self.config['experiment_filestore']
         shared_experiment_filestore_arg = f'{filestore}:{filestore}'
+        # The measurer's per-cycle scratch lives in the filestore rather than
+        # the container layer, which sits on docker's (smaller) root disk.
+        measurement_folders_arg = (
+            f'{filestore}/{self.config["experiment"]}/measurement-folders:'
+            '/work/measurement-folders')
         # TODO: (#484) Use config in function args or set as environment
         # variables.
         set_docker_registry_arg = f'DOCKER_REGISTRY={docker_registry}'
@@ -571,6 +576,8 @@ class LocalDispatcher(BaseDispatcher):
             shared_experiment_filestore_arg,
             '-v',
             shared_report_filestore_arg,
+            '-v',
+            measurement_folders_arg,
         ] + environment_args + [
             '--shm-size=2g',
             '--cap-add=SYS_PTRACE',

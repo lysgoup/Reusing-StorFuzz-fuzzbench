@@ -36,6 +36,11 @@ done{% endif %}
 
 mkdir -p {{experiment_filestore}}/{{experiment}}/logs/{{benchmark}}
 
+# A local runner keeps its output corpus in the filestore rather than the
+# container layer. The mount is the corpus's parent, not the corpus itself:
+# the runner rmtree's and re-creates the corpus dir, which a mount point can't
+# survive.
+
 docker run \
 --privileged --cpus={{num_cpu_cores}} --rm \
 {% if cpuset %}--cpuset-cpus={{cpuset}} {% endif %} \
@@ -55,6 +60,7 @@ docker run \
 -e DOCKER_REGISTRY={{docker_registry}} {% if not local_experiment %}-e CLOUD_PROJECT={{cloud_project}} -e CLOUD_COMPUTE_ZONE={{cloud_compute_zone}} {% endif %}\
 -e EXPERIMENT_FILESTORE={{experiment_filestore}} {% if local_experiment %}-v {{experiment_filestore}}:{{experiment_filestore}} {% endif %}\
 -e REPORT_FILESTORE={{report_filestore}} {% if local_experiment %}-v {{report_filestore}}:{{report_filestore}} {% endif %}\
+{% if local_experiment %}-v {{experiment_filestore}}/{{experiment}}/runner-corpus/{{benchmark}}-{{fuzzer}}/trial-{{trial_id}}:/runner-corpus -e OUTPUT_CORPUS_DIR=/runner-corpus/corpus {% endif %}\
 -e FUZZ_TARGET={{fuzz_target}} \
 -e PRIVATE={{private}} \
 -e LOCAL_EXPERIMENT={{local_experiment}} \
