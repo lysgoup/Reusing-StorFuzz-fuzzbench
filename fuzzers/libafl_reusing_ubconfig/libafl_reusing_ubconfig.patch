@@ -1,0 +1,403 @@
+unibench's forkserver_libafl_reusing fuzzer, forkserver -> in-process, and
+nothing else.
+
+Applies after fuzzers/reusing_forkserver_cc/src/main.rs -- the fuzzer the
+unibench reusing arm runs -- is copied over fuzzers/fuzzbench/src/lib.rs at
+LibAFL_reusing 7c98c7fd (see builder.Dockerfile). 7c98c7fd is the unibench
+arm's 4f590eb2 plus one reusing_core change an in-process fuzzer needs: each
+try's cursor is saved before the try runs, so a restart after a crash resumes
+past it instead of replaying it forever. Its other change, with_max_base(), is
+unused here; ReusingEnergyStage::new() keeps unibench's cap of 128. The diff
+to src/lib.rs is therefore the complete difference from that fuzzer:
+
+  - executor   ForkserverExecutor -> InProcessExecutor over the target's
+               LLVMFuzzerTestOneInput, after LLVMFuzzerInitialize
+  - observer   the edges map in __AFL_SHM_ID shared memory -> the same map
+               in this process (std_edges_map_observer, same name)
+  - tokens     the tokens the forkserver target sends -> autotokens() from
+               this binary
+  - restarts   SimpleEventManager -> SimpleRestartingEventManager: a crash
+               kills this process, so a fresh one resumes from the state left
+               in shared memory. FromSeed marks the corpus only on a fresh
+               start; after a restart the corpus holds finds too
+  - output     the target's stdout/stderr go to /dev/null, as the forkserver
+               child's did; the logger (the reusing stage's counters), the
+               monitor and the fuzzer's own messages write to a copy of stdout
+  - CLI        no target executable, target arguments, --debug-child or
+               --signal; libafl_main() is the entry the target's main calls
+
+Cargo.toml and src/bin/libafl_cc.rs take the unibench reusing crate's
+instrumentation and dependencies: trace-pc-guard and AutoTokens only (no
+trace-cmp, no CmpLogRtn pass), libafl with track_hit_feedbacks, clap with
+derive, env_logger, log, reusing_core.
+
+diff --git a/fuzzers/fuzzbench/Cargo.toml b/fuzzers/fuzzbench/Cargo.toml
+index 916ae5b..0549cf1 100644
+--- a/fuzzers/fuzzbench/Cargo.toml
++++ b/fuzzers/fuzzbench/Cargo.toml
+@@ -25,14 +25,17 @@ cc = { version = "1.0", features = ["parallel"] }
+ which = "6.0"
+ 
+ [dependencies]
+-libafl = { path = "../../libafl/" }
++libafl = { path = "../../libafl/", features = ["track_hit_feedbacks"] }
+ libafl_bolts = { path = "../../libafl_bolts/" }
+ libafl_targets = { path = "../../libafl_targets/", features = ["sancov_pcguard_hitcounts", "sancov_cmplog", "libfuzzer"] }
+ # TODO Include it only when building cc
+ libafl_cc = { path = "../../libafl_cc/" }
+-clap = { version = "4.0", features = ["default"] }
++clap = { version = "4.0", features = ["derive"] }
+ nix = { version = "0.29", features = ["fs"] }
+ mimalloc = { version = "*", default-features = false }
++env_logger = "*"
++log = "*"
++reusing_core = { path = "../reusing_core/" }
+ 
+ [lib]
+ name = "fuzzbench"
+diff --git a/fuzzers/fuzzbench/src/bin/libafl_cc.rs b/fuzzers/fuzzbench/src/bin/libafl_cc.rs
+index 972c99c..dede114 100644
+--- a/fuzzers/fuzzbench/src/bin/libafl_cc.rs
++++ b/fuzzers/fuzzbench/src/bin/libafl_cc.rs
+@@ -17,7 +17,7 @@ pub fn main() {
+         dir.pop();
+ 
+         // Must be always present, even without --libafl
+-        args.push("-fsanitize-coverage=trace-pc-guard,trace-cmp".into());
++        args.push("-fsanitize-coverage=trace-pc-guard".into());
+ 
+         let mut cc = ClangWrapper::new();
+ 
+@@ -33,7 +33,6 @@ pub fn main() {
+             .parse_args(&args)
+             .expect("Failed to parse the command line")
+             .link_staticlib(&dir, "fuzzbench")
+-            .add_pass(LLVMPasses::CmpLogRtn)
+             .run()
+             .expect("Failed to run the wrapped compiler")
+         {
+diff --git a/fuzzers/fuzzbench/src/lib.rs b/fuzzers/fuzzbench/src/lib.rs
+index 264123e..f693470 100644
+--- a/fuzzers/fuzzbench/src/lib.rs
++++ b/fuzzers/fuzzbench/src/lib.rs
+@@ -1,32 +1,40 @@
+ use core::{ptr::addr_of_mut, time::Duration};
+-use std::path::PathBuf;
++#[cfg(unix)]
++use std::os::unix::io::{AsRawFd, FromRawFd};
++use std::{
++    env,
++    fs::File,
++    io::{self, Write},
++    path::PathBuf,
++};
+ 
+ use clap::Parser;
+ use libafl::{
+     corpus::{Corpus, OnDiskCorpus},
+-    events::{SimpleEventManager, EVENTMGR_SIGHANDLER_STATE},
+-    executors::{forkserver::ForkserverExecutor, HasObservers},
++    events::{SimpleRestartingEventManager, EVENTMGR_SIGHANDLER_STATE},
++    executors::{inprocess::InProcessExecutor, ExitKind},
+     feedback_and_fast, feedback_or,
+     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
+     fuzzer::{Fuzzer, StdFuzzer},
+-    inputs::{BytesInput, Input},
++    inputs::{BytesInput, HasTargetBytes, Input},
+     monitors::{SimpleMonitor, OnDiskTOMLMonitor},
+     mutators::{scheduled::havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
+-    observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
++    observers::{CanTrack, HitcountsMapObserver, TimeObserver},
+     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
+     stages::mutational::StdMutationalStage,
+     state::{HasCorpus, StdState},
+-    HasMetadata,
++    Error, HasMetadata,
+ };
+ use libafl_bolts::{
+-    os::unix_signals::setup_signal_handler,
++    os::{dup, dup2, unix_signals::setup_signal_handler},
+     rands::StdRand,
+-    shmem::{ShMem, ShMemProvider, UnixShMemProvider},
+-    tuples::{tuple_list, Handled, MatchNameRef, Merge},
+-    AsSliceMut, Truncate,
++    shmem::{ShMemProvider, StdShMemProvider},
++    tuples::{tuple_list, Merge},
++    AsSlice,
++};
++use libafl_targets::{
++    autotokens, libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer,
+ };
+-use libafl_targets::EDGES_MAP_SIZE_IN_USE;
+-use nix::sys::signal::Signal;
+ use reusing_core::{Ablation, FromSeed, ReusingEnergyStage, ReusingStage};
+ 
+ /// The commandline args this fuzzer accepts
+@@ -37,13 +45,6 @@ use reusing_core::{Ablation, FromSeed, ReusingEnergyStage, ReusingStage};
+     author = "ergrelet <ergrelet@users.noreply.github.com>"
+ )]
+ struct Opt {
+-    #[arg(
+-        help = "The instrumented binary we want to fuzz",
+-        name = "EXEC",
+-        required = true
+-    )]
+-    executable: String,
+-
+     #[arg(
+         help = "The directory to read initial inputs from ('seeds')",
+         name = "INPUT_DIR",
+@@ -59,31 +60,6 @@ struct Opt {
+     )]
+     timeout: u64,
+ 
+-    #[arg(
+-        help = "If not set, the child's stdout and stderror will be redirected to /dev/null",
+-        short = 'd',
+-        long = "debug-child",
+-        default_value = "false"
+-    )]
+-    debug_child: bool,
+-
+-    #[arg(
+-        help = "Arguments passed to the target",
+-        name = "arguments",
+-        num_args(1..),
+-        allow_hyphen_values = true,
+-    )]
+-    arguments: Vec<String>,
+-
+-    #[arg(
+-        help = "Signal used to stop child",
+-        short = 's',
+-        long = "signal",
+-        value_parser = str::parse::<Signal>,
+-        default_value = "SIGKILL"
+-    )]
+-    signal: Signal,
+-
+     #[arg(
+         help = "Output directory for queue and crashes (created if absent)",
+         short = 'o',
+@@ -113,9 +89,22 @@ struct Opt {
+     reusing_ablation: Option<String>,
+ }
+ 
++/// The fuzzer main (as `no_mangle` C function), called by the target's
++/// libFuzzer-style main
+ #[allow(clippy::similar_names)]
+-pub fn main() {
+-    env_logger::init();
++#[no_mangle]
++pub extern "C" fn libafl_main() {
++    // The logger and the monitor write to a copy of stdout; stdout and stderr
++    // themselves go to /dev/null below, as the forkserver fuzzer's child
++    // output did. The logger carries the reusing stage's counters.
++    let mut stdout_cpy = unsafe {
++        let new_fd = dup(io::stdout().as_raw_fd()).unwrap();
++        File::from_raw_fd(new_fd)
++    };
++    let mut log_out = stdout_cpy.try_clone().unwrap();
++    env_logger::Builder::from_default_env()
++        .target(env_logger::Target::Pipe(Box::new(stdout_cpy.try_clone().unwrap())))
++        .init();
+ 
+     // The harness launches this as a shell background job, which starts it
+     // with SIGINT and SIGQUIT ignored; SimpleEventManager installs nothing, so
+@@ -125,7 +114,6 @@ pub fn main() {
+     unsafe { setup_signal_handler(addr_of_mut!(EVENTMGR_SIGHANDLER_STATE)) }
+         .expect("Failed to install the shutdown signal handler");
+ 
+-    const MAP_SIZE: usize = EDGES_MAP_SIZE_IN_USE;
+     let opt = Opt::parse();
+ 
+     let corpus_dirs: Vec<PathBuf> = [opt.in_dir].to_vec();
+@@ -135,18 +123,29 @@ pub fn main() {
+     std::fs::create_dir_all(&queue_dir).expect("Failed to create queue dir");
+     std::fs::create_dir_all(&crashes_dir).expect("Failed to create crashes dir");
+ 
+-    // The unix shmem provider supported by LibAFL for shared memory
+-    let mut shmem_provider = UnixShMemProvider::new().unwrap();
++    let stats_file = opt.output_dir.join("stats.toml");
+ 
+-    // The coverage map shared between observer and executor
+-    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+-    // let the forkserver know the shmid
+-    shmem.write_to_env("__AFL_SHM_ID").unwrap();
+-    let shmem_buf = shmem.as_slice_mut();
++    // The Monitor trait define how the fuzzer stats are reported to the user
++    let monitor = OnDiskTOMLMonitor::new(
++        &stats_file,
++        SimpleMonitor::with_user_monitor(move |s| {
++            writeln!(stdout_cpy, "{s}").unwrap();
++        }),
++    );
+ 
+-    // Create an observation channel using the signals map
++    // The target runs in this process: a crash restarts the fuzzer from the
++    // state it left in shared memory
++    let mut shmem_provider = StdShMemProvider::new().unwrap();
++    let (state, mut mgr) = match SimpleRestartingEventManager::launch(monitor, &mut shmem_provider)
++    {
++        Ok(res) => res,
++        Err(Error::ShuttingDown) => return,
++        Err(err) => panic!("Failed to setup the restarter: {err}"),
++    };
++
++    // Create an observation channel using the in-process edges map
+     let edges_observer = unsafe {
+-        HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
++        HitcountsMapObserver::new(std_edges_map_observer("shared_mem")).track_indices()
+     };
+ 
+     // Create an observation channel to keep track of the execution time
+@@ -164,30 +163,19 @@ pub fn main() {
+         MaxMapFeedback::with_name("mapfeedback_metadata_objective", &edges_observer)
+     );
+ 
+-    // create a State from scratch
+-    let mut state = StdState::new(
+-        StdRand::new(),
+-        // Corpus that will be evolved, saved to disk so it persists across runs
+-        OnDiskCorpus::<BytesInput>::new(&queue_dir).unwrap(),
+-        // Corpus in which we store solutions (crashes)
+-        OnDiskCorpus::<BytesInput>::new(&crashes_dir).unwrap(),
+-        &mut feedback,
+-        &mut objective,
+-    )
+-    .unwrap();
+-
+-    let stats_file = opt.output_dir.join("stats.toml");
+-
+-    // The Monitor trait define how the fuzzer stats are reported to the user
+-    let monitor = OnDiskTOMLMonitor::new(
+-        &stats_file,
+-        SimpleMonitor::with_user_monitor(|s| {
+-            println!("{s}");
+-        }),
+-    );
+-
+-    // The event manager handle the various events generated during the fuzzing loop
+-    let mut mgr = SimpleEventManager::new(monitor);
++    // create a State from scratch, unless restarting
++    let mut state = state.unwrap_or_else(|| {
++        StdState::new(
++            StdRand::new(),
++            // Corpus that will be evolved, saved to disk so it persists across runs
++            OnDiskCorpus::<BytesInput>::new(&queue_dir).unwrap(),
++            // Corpus in which we store solutions (crashes)
++            OnDiskCorpus::<BytesInput>::new(&crashes_dir).unwrap(),
++            &mut feedback,
++            &mut objective,
++        )
++        .unwrap()
++    });
+ 
+     // A minimization+queue policy to get testcasess from the corpus
+     let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
+@@ -195,29 +183,44 @@ pub fn main() {
+     // A fuzzer with feedbacks and a corpus scheduler
+     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+ 
+-    let debug_child = opt.debug_child;
+-    let args = opt.arguments;
+-    let observer_handle = edges_observer.handle();
++    // Call LLVMFuzzerInitialize() if present
++    let args: Vec<String> = env::args().collect();
++    if libfuzzer_initialize(&args) == -1 {
++        println!("Warning: LLVMFuzzerInitialize failed with -1");
++    }
++
++    // The wrapped harness function, calling out to the LLVM-style harness
++    let mut harness = |input: &BytesInput| {
++        let target = input.target_bytes();
++        libfuzzer_test_one_input(target.as_slice());
++        ExitKind::Ok
++    };
+ 
++    // The tokens the AutoTokens pass put in this binary
+     let mut tokens = Tokens::new();
+-    let mut executor = ForkserverExecutor::builder()
+-        .program(opt.executable)
+-        .debug_child(debug_child)
+-        .shmem_provider(&mut shmem_provider)
+-        .autotokens(&mut tokens)
+-        .parse_afl_cmdline(args)
+-        .coverage_map_size(MAP_SIZE)
+-        .timeout(Duration::from_millis(opt.timeout))
+-        .kill_signal(opt.signal)
+-        .build(tuple_list!(time_observer, edges_observer))
+-        .unwrap();
++    tokens += autotokens().unwrap();
++    let mut executor = InProcessExecutor::with_timeout(
++        &mut harness,
++        tuple_list!(time_observer, edges_observer),
++        &mut fuzzer,
++        &mut state,
++        &mut mgr,
++        Duration::from_millis(opt.timeout),
++    )
++    .unwrap();
+ 
+-    if let Some(dynamic_map_size) = executor.coverage_map_size() {
+-        executor.observers_mut()[&observer_handle]
+-            .as_mut()
+-            .truncate(dynamic_map_size);
++    // The target's output goes nowhere
++    #[cfg(unix)]
++    {
++        let null = File::open("/dev/null").unwrap();
++        dup2(null.as_raw_fd(), io::stdout().as_raw_fd()).unwrap();
++        dup2(null.as_raw_fd(), io::stderr().as_raw_fd()).unwrap();
+     }
+ 
++    // A restarted process finds the state, seeds and finds alike, where the
++    // crashed one left it
++    let fresh_start = state.must_load_initial_inputs();
++
+     // In case the corpus is empty (on first run), reset
+     if state.must_load_initial_inputs() {
+         state
+@@ -228,7 +231,7 @@ pub fn main() {
+                     &corpus_dirs, err
+                 )
+             });
+-        println!("We imported {} inputs from disk.", state.corpus().count());
++        writeln!(log_out, "We imported {} inputs from disk.", state.corpus().count()).unwrap();
+     }
+     
+     let signal_dir = queue_dir.join("signal");
+@@ -247,7 +250,12 @@ pub fn main() {
+         // them apart. Loud failure on a missing scan dir for the same reason
+         // ReusingStage::new is loud: an arm quietly running without its pool
+         // is indistinguishable from the baseline afterwards.
+-        let seed_ids: Vec<_> = state.corpus().ids().collect();
++        // Only on a fresh start: after a restart the corpus holds finds too.
++        let seed_ids: Vec<_> = if fresh_start {
++            state.corpus().ids().collect()
++        } else {
++            Vec::new()
++        };
+         for id in seed_ids {
+             state
+                 .corpus()
+@@ -294,7 +302,8 @@ pub fn main() {
+         // which arm it really was; the AFL++ arm keeps the same record as
+         // reusing_load.log.
+         let pool_stats = reusing_stage.pool().stats();
+-        println!(
++        writeln!(
++            log_out,
+             "Reusing pool loaded: {} entries ({} segments, {} patterns), {} unsolved sites, {} malformed lines, ablation={:?}",
+             pool_stats.entries,
+             pool_stats.segments,
+@@ -302,7 +311,8 @@ pub fn main() {
+             pool_stats.unsolved_sites,
+             pool_stats.malformed,
+             reusing_stage.ablation()
+-        );
++        )
++        .unwrap();
+         let mut stages = tuple_list!(
+             reusing_stage,
+             ReusingEnergyStage::new(StdMutationalStage::new(mutator))
