@@ -1,0 +1,370 @@
+unibench's forkserver_libafl fuzzer, forkserver -> in-process, without AutoTokens.
+
+Applies after unibench's own patches (forkserver_libafl_baseline,
+forkserver_toml_monitor, forkserver_libafl_dryrun, forkserver_libafl_sigint,
+copied verbatim from Reusing-unibench_build/forkserver_libafl/) and after
+fuzzers/forkserver_libafl_cc/src/main.rs -- the fuzzer unibench runs -- is
+copied over fuzzers/fuzzbench/src/lib.rs (see builder.Dockerfile). The diff to
+src/lib.rs is therefore the complete difference from that fuzzer:
+
+  - executor   ForkserverExecutor -> InProcessExecutor over the target's
+               LLVMFuzzerTestOneInput, after LLVMFuzzerInitialize
+  - observer   the edges map in __AFL_SHM_ID shared memory -> the same map
+               in this process (std_edges_map_observer, same name)
+  - tokens     the tokens the forkserver target sends -> autotokens() from
+               this binary (empty here, see below)
+  - restarts   SimpleEventManager -> SimpleRestartingEventManager: a crash
+               kills this process, so a fresh one resumes from the state left
+               in shared memory
+  - output     the target's stdout/stderr go to /dev/null, as the forkserver
+               child's did; the monitor writes to a copy of stdout
+  - CLI        no target executable, target arguments, --debug-child or
+               --signal; libafl_main() is the entry the target's main calls
+
+Cargo.toml and src/bin/libafl_cc.rs take unibench's instrumentation and the
+unibench crate's dependencies: trace-pc-guard only (no trace-cmp, no
+CmpLogRtn pass, no sancov_cmplog runtime), clap with derive, env_logger.
+
+One deliberate difference from unibench: no AutoTokens pass. The target then
+has no libafl_token section, autotokens() returns no tokens, and the tokens
+mutations find nothing to insert -- a run without any dictionary. (unibench's
+forkserver_libafl_baseline.patch adds the pass to forkserver_libafl_cc.)
+
+diff --git a/fuzzers/fuzzbench/Cargo.toml b/fuzzers/fuzzbench/Cargo.toml
+index 916ae5b..fea6b06 100644
+--- a/fuzzers/fuzzbench/Cargo.toml
++++ b/fuzzers/fuzzbench/Cargo.toml
+@@ -27,12 +27,13 @@ which = "6.0"
+ [dependencies]
+ libafl = { path = "../../libafl/" }
+ libafl_bolts = { path = "../../libafl_bolts/" }
+-libafl_targets = { path = "../../libafl_targets/", features = ["sancov_pcguard_hitcounts", "sancov_cmplog", "libfuzzer"] }
++libafl_targets = { path = "../../libafl_targets/", features = ["sancov_pcguard_hitcounts", "libfuzzer"] }
+ # TODO Include it only when building cc
+ libafl_cc = { path = "../../libafl_cc/" }
+-clap = { version = "4.0", features = ["default"] }
++clap = { version = "4.0", features = ["derive"] }
+ nix = { version = "0.29", features = ["fs"] }
+ mimalloc = { version = "*", default-features = false }
++env_logger = "0.11"
+ 
+ [lib]
+ name = "fuzzbench"
+diff --git a/fuzzers/fuzzbench/src/bin/libafl_cc.rs b/fuzzers/fuzzbench/src/bin/libafl_cc.rs
+index 972c99c..dd7ac87 100644
+--- a/fuzzers/fuzzbench/src/bin/libafl_cc.rs
++++ b/fuzzers/fuzzbench/src/bin/libafl_cc.rs
+@@ -1,6 +1,6 @@
+ use std::env;
+ 
+-use libafl_cc::{ClangWrapper, CompilerWrapper, LLVMPasses, ToolWrapper};
++use libafl_cc::{ClangWrapper, CompilerWrapper, ToolWrapper};
+ 
+ pub fn main() {
+     let mut args: Vec<String> = env::args().collect();
+@@ -17,13 +17,10 @@ pub fn main() {
+         dir.pop();
+ 
+         // Must be always present, even without --libafl
+-        args.push("-fsanitize-coverage=trace-pc-guard,trace-cmp".into());
++        args.push("-fsanitize-coverage=trace-pc-guard".into());
+ 
+         let mut cc = ClangWrapper::new();
+ 
+-        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+-        cc.add_pass(LLVMPasses::AutoTokens);
+-
+         if let Some(code) = cc
+             .cpp(is_cpp)
+             // silence the compiler wrapper output, needed for some configure scripts.
+@@ -33,7 +30,6 @@ pub fn main() {
+             .parse_args(&args)
+             .expect("Failed to parse the command line")
+             .link_staticlib(&dir, "fuzzbench")
+-            .add_pass(LLVMPasses::CmpLogRtn)
+             .run()
+             .expect("Failed to run the wrapped compiler")
+         {
+diff --git a/fuzzers/fuzzbench/src/lib.rs b/fuzzers/fuzzbench/src/lib.rs
+index bf4c965..3618deb 100644
+--- a/fuzzers/fuzzbench/src/lib.rs
++++ b/fuzzers/fuzzbench/src/lib.rs
+@@ -1,32 +1,40 @@
+ use core::{ptr::addr_of_mut, time::Duration};
+-use std::path::PathBuf;
++#[cfg(unix)]
++use std::os::unix::io::{AsRawFd, FromRawFd};
++use std::{
++    env,
++    fs::File,
++    io::{self, Write},
++    path::PathBuf,
++};
+ 
+ use clap::Parser;
+ use libafl::{
+     corpus::{Corpus, OnDiskCorpus},
+-    events::{SimpleEventManager, EVENTMGR_SIGHANDLER_STATE},
+-    executors::{forkserver::ForkserverExecutor, HasObservers},
++    events::{SimpleRestartingEventManager, EVENTMGR_SIGHANDLER_STATE},
++    executors::{inprocess::InProcessExecutor, ExitKind},
+     feedback_and_fast, feedback_or,
+     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
+     fuzzer::{Fuzzer, StdFuzzer},
+-    inputs::BytesInput,
++    inputs::{BytesInput, HasTargetBytes},
+     monitors::{SimpleMonitor, OnDiskTOMLMonitor},
+     mutators::{scheduled::havoc_mutations, tokens_mutations, StdScheduledMutator, Tokens},
+-    observers::{CanTrack, HitcountsMapObserver, StdMapObserver, TimeObserver},
++    observers::{CanTrack, HitcountsMapObserver, TimeObserver},
+     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler},
+     stages::mutational::StdMutationalStage,
+     state::{HasCorpus, StdState},
+-    HasMetadata,
++    Error, HasMetadata,
+ };
+ use libafl_bolts::{
+-    os::unix_signals::setup_signal_handler,
++    os::{dup, dup2, unix_signals::setup_signal_handler},
+     rands::StdRand,
+-    shmem::{ShMem, ShMemProvider, UnixShMemProvider},
+-    tuples::{tuple_list, Handled, MatchNameRef, Merge},
+-    AsSliceMut, Truncate,
++    shmem::{ShMemProvider, StdShMemProvider},
++    tuples::{tuple_list, Merge},
++    AsSlice,
++};
++use libafl_targets::{
++    autotokens, libfuzzer_initialize, libfuzzer_test_one_input, std_edges_map_observer,
+ };
+-use libafl_targets::EDGES_MAP_SIZE_IN_USE;
+-use nix::sys::signal::Signal;
+ 
+ /// The commandline args this fuzzer accepts
+ #[derive(Debug, Parser)]
+@@ -36,13 +44,6 @@ use nix::sys::signal::Signal;
+     author = "ergrelet <ergrelet@users.noreply.github.com>"
+ )]
+ struct Opt {
+-    #[arg(
+-        help = "The instrumented binary we want to fuzz",
+-        name = "EXEC",
+-        required = true
+-    )]
+-    executable: String,
+-
+     #[arg(
+         help = "The directory to read initial inputs from ('seeds')",
+         name = "INPUT_DIR",
+@@ -58,31 +59,6 @@ struct Opt {
+     )]
+     timeout: u64,
+ 
+-    #[arg(
+-        help = "If not set, the child's stdout and stderror will be redirected to /dev/null",
+-        short = 'd',
+-        long = "debug-child",
+-        default_value = "false"
+-    )]
+-    debug_child: bool,
+-
+-    #[arg(
+-        help = "Arguments passed to the target",
+-        name = "arguments",
+-        num_args(1..),
+-        allow_hyphen_values = true,
+-    )]
+-    arguments: Vec<String>,
+-
+-    #[arg(
+-        help = "Signal used to stop child",
+-        short = 's',
+-        long = "signal",
+-        value_parser = str::parse::<Signal>,
+-        default_value = "SIGKILL"
+-    )]
+-    signal: Signal,
+-
+     #[arg(
+         help = "Output directory for queue and crashes (created if absent)",
+         short = 'o',
+@@ -92,8 +68,11 @@ struct Opt {
+     output_dir: PathBuf,
+ }
+ 
++/// The fuzzer main (as `no_mangle` C function), called by the target's
++/// libFuzzer-style main
+ #[allow(clippy::similar_names)]
+-pub fn main() {
++#[no_mangle]
++pub extern "C" fn libafl_main() {
+     env_logger::init();
+ 
+     // The harness launches this as a shell background job, which starts it
+@@ -104,7 +83,6 @@ pub fn main() {
+     unsafe { setup_signal_handler(addr_of_mut!(EVENTMGR_SIGHANDLER_STATE)) }
+         .expect("Failed to install the shutdown signal handler");
+ 
+-    const MAP_SIZE: usize = EDGES_MAP_SIZE_IN_USE;
+     let opt = Opt::parse();
+ 
+     let corpus_dirs: Vec<PathBuf> = [opt.in_dir].to_vec();
+@@ -114,18 +92,37 @@ pub fn main() {
+     std::fs::create_dir_all(&queue_dir).expect("Failed to create queue dir");
+     std::fs::create_dir_all(&crashes_dir).expect("Failed to create crashes dir");
+ 
+-    // The unix shmem provider supported by LibAFL for shared memory
+-    let mut shmem_provider = UnixShMemProvider::new().unwrap();
++    // The monitor writes to a copy of stdout; stdout and stderr themselves go
++    // to /dev/null below, as the forkserver fuzzer's child output did
++    let mut stdout_cpy = unsafe {
++        let new_fd = dup(io::stdout().as_raw_fd()).unwrap();
++        File::from_raw_fd(new_fd)
++    };
++    let mut log_out = stdout_cpy.try_clone().unwrap();
++
++    let stats_file = opt.output_dir.join("stats.toml");
++
++    // The Monitor trait define how the fuzzer stats are reported to the user
++    let monitor = OnDiskTOMLMonitor::new(
++        &stats_file,
++        SimpleMonitor::with_user_monitor(move |s| {
++            writeln!(stdout_cpy, "{s}").unwrap();
++        }),
++    );
+ 
+-    // The coverage map shared between observer and executor
+-    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+-    // let the forkserver know the shmid
+-    shmem.write_to_env("__AFL_SHM_ID").unwrap();
+-    let shmem_buf = shmem.as_slice_mut();
++    // The target runs in this process: a crash restarts the fuzzer from the
++    // state it left in shared memory
++    let mut shmem_provider = StdShMemProvider::new().unwrap();
++    let (state, mut mgr) = match SimpleRestartingEventManager::launch(monitor, &mut shmem_provider)
++    {
++        Ok(res) => res,
++        Err(Error::ShuttingDown) => return,
++        Err(err) => panic!("Failed to setup the restarter: {err}"),
++    };
+ 
+-    // Create an observation channel using the signals map
++    // Create an observation channel using the in-process edges map
+     let edges_observer = unsafe {
+-        HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
++        HitcountsMapObserver::new(std_edges_map_observer("shared_mem")).track_indices()
+     };
+ 
+     // Create an observation channel to keep track of the execution time
+@@ -143,30 +140,19 @@ pub fn main() {
+         MaxMapFeedback::with_name("mapfeedback_metadata_objective", &edges_observer)
+     );
+ 
+-    // create a State from scratch
+-    let mut state = StdState::new(
+-        StdRand::new(),
+-        // Corpus that will be evolved, saved to disk so it persists across runs
+-        OnDiskCorpus::<BytesInput>::new(&queue_dir).unwrap(),
+-        // Corpus in which we store solutions (crashes)
+-        OnDiskCorpus::<BytesInput>::new(&crashes_dir).unwrap(),
+-        &mut feedback,
+-        &mut objective,
+-    )
+-    .unwrap();
+-
+-    let stats_file = opt.output_dir.join("stats.toml");
+-
+-    // The Monitor trait define how the fuzzer stats are reported to the user
+-    let monitor = OnDiskTOMLMonitor::new(
+-        &stats_file,
+-        SimpleMonitor::with_user_monitor(|s| {
+-            println!("{s}");
+-        }),
+-    );
+-
+-    // The event manager handle the various events generated during the fuzzing loop
+-    let mut mgr = SimpleEventManager::new(monitor);
++    // create a State from scratch, unless restarting
++    let mut state = state.unwrap_or_else(|| {
++        StdState::new(
++            StdRand::new(),
++            // Corpus that will be evolved, saved to disk so it persists across runs
++            OnDiskCorpus::<BytesInput>::new(&queue_dir).unwrap(),
++            // Corpus in which we store solutions (crashes)
++            OnDiskCorpus::<BytesInput>::new(&crashes_dir).unwrap(),
++            &mut feedback,
++            &mut objective,
++        )
++        .unwrap()
++    });
+ 
+     // A minimization+queue policy to get testcasess from the corpus
+     let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
+@@ -174,27 +160,39 @@ pub fn main() {
+     // A fuzzer with feedbacks and a corpus scheduler
+     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
+ 
+-    let debug_child = opt.debug_child;
+-    let args = opt.arguments;
+-    let observer_handle = edges_observer.handle();
++    // Call LLVMFuzzerInitialize() if present
++    let args: Vec<String> = env::args().collect();
++    if libfuzzer_initialize(&args) == -1 {
++        println!("Warning: LLVMFuzzerInitialize failed with -1");
++    }
++
++    // The wrapped harness function, calling out to the LLVM-style harness
++    let mut harness = |input: &BytesInput| {
++        let target = input.target_bytes();
++        libfuzzer_test_one_input(target.as_slice());
++        ExitKind::Ok
++    };
+ 
++    // Tokens an AutoTokens pass put in this binary (none: libafl_cc.rs runs no
++    // such pass)
+     let mut tokens = Tokens::new();
+-    let mut executor = ForkserverExecutor::builder()
+-        .program(opt.executable)
+-        .debug_child(debug_child)
+-        .shmem_provider(&mut shmem_provider)
+-        .autotokens(&mut tokens)
+-        .parse_afl_cmdline(args)
+-        .coverage_map_size(MAP_SIZE)
+-        .timeout(Duration::from_millis(opt.timeout))
+-        .kill_signal(opt.signal)
+-        .build(tuple_list!(time_observer, edges_observer))
+-        .unwrap();
+-
+-    if let Some(dynamic_map_size) = executor.coverage_map_size() {
+-        executor.observers_mut()[&observer_handle]
+-            .as_mut()
+-            .truncate(dynamic_map_size);
++    tokens += autotokens().unwrap();
++    let mut executor = InProcessExecutor::with_timeout(
++        &mut harness,
++        tuple_list!(time_observer, edges_observer),
++        &mut fuzzer,
++        &mut state,
++        &mut mgr,
++        Duration::from_millis(opt.timeout),
++    )
++    .unwrap();
++
++    // The target's output goes nowhere
++    #[cfg(unix)]
++    {
++        let null = File::open("/dev/null").unwrap();
++        dup2(null.as_raw_fd(), io::stdout().as_raw_fd()).unwrap();
++        dup2(null.as_raw_fd(), io::stderr().as_raw_fd()).unwrap();
+     }
+ 
+     // In case the corpus is empty (on first run), reset
+@@ -207,7 +205,7 @@ pub fn main() {
+                     &corpus_dirs, err
+                 )
+             });
+-        println!("We imported {} inputs from disk.", state.corpus().count());
++        writeln!(log_out, "We imported {} inputs from disk.", state.corpus().count()).unwrap();
+     }
+     
+     let signal_dir = queue_dir.join("signal");
