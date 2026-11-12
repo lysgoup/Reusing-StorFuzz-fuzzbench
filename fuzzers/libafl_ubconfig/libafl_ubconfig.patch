@@ -1,4 +1,4 @@
-unibench's forkserver_libafl fuzzer, forkserver -> in-process, without AutoTokens.
+unibench's forkserver_libafl fuzzer, forkserver -> in-process, and nothing else.
 
 Applies after unibench's own patches (forkserver_libafl_baseline,
 forkserver_toml_monitor, forkserver_libafl_dryrun, forkserver_libafl_sigint,
@@ -12,7 +12,7 @@ src/lib.rs is therefore the complete difference from that fuzzer:
   - observer   the edges map in __AFL_SHM_ID shared memory -> the same map
                in this process (std_edges_map_observer, same name)
   - tokens     the tokens the forkserver target sends -> autotokens() from
-               this binary (empty here, see below)
+               this binary
   - restarts   SimpleEventManager -> SimpleRestartingEventManager: a crash
                kills this process, so a fresh one resumes from the state left
                in shared memory
@@ -22,13 +22,9 @@ src/lib.rs is therefore the complete difference from that fuzzer:
                --signal; libafl_main() is the entry the target's main calls
 
 Cargo.toml and src/bin/libafl_cc.rs take unibench's instrumentation and the
-unibench crate's dependencies: trace-pc-guard only (no trace-cmp, no
-CmpLogRtn pass, no sancov_cmplog runtime), clap with derive, env_logger.
-
-One deliberate difference from unibench: no AutoTokens pass. The target then
-has no libafl_token section, autotokens() returns no tokens, and the tokens
-mutations find nothing to insert -- a run without any dictionary. (unibench's
-forkserver_libafl_baseline.patch adds the pass to forkserver_libafl_cc.)
+unibench crate's dependencies: trace-pc-guard and AutoTokens only (no
+trace-cmp, no CmpLogRtn pass, no sancov_cmplog runtime), clap with derive,
+env_logger.
 
 diff --git a/fuzzers/fuzzbench/Cargo.toml b/fuzzers/fuzzbench/Cargo.toml
 index 916ae5b..fea6b06 100644
@@ -51,18 +47,10 @@ index 916ae5b..fea6b06 100644
  [lib]
  name = "fuzzbench"
 diff --git a/fuzzers/fuzzbench/src/bin/libafl_cc.rs b/fuzzers/fuzzbench/src/bin/libafl_cc.rs
-index 972c99c..dd7ac87 100644
+index 972c99c..dede114 100644
 --- a/fuzzers/fuzzbench/src/bin/libafl_cc.rs
 +++ b/fuzzers/fuzzbench/src/bin/libafl_cc.rs
-@@ -1,6 +1,6 @@
- use std::env;
- 
--use libafl_cc::{ClangWrapper, CompilerWrapper, LLVMPasses, ToolWrapper};
-+use libafl_cc::{ClangWrapper, CompilerWrapper, ToolWrapper};
- 
- pub fn main() {
-     let mut args: Vec<String> = env::args().collect();
-@@ -17,13 +17,10 @@ pub fn main() {
+@@ -17,7 +17,7 @@ pub fn main() {
          dir.pop();
  
          // Must be always present, even without --libafl
@@ -71,13 +59,7 @@ index 972c99c..dd7ac87 100644
  
          let mut cc = ClangWrapper::new();
  
--        #[cfg(any(target_os = "linux", target_vendor = "apple"))]
--        cc.add_pass(LLVMPasses::AutoTokens);
--
-         if let Some(code) = cc
-             .cpp(is_cpp)
-             // silence the compiler wrapper output, needed for some configure scripts.
-@@ -33,7 +30,6 @@ pub fn main() {
+@@ -33,7 +33,6 @@ pub fn main() {
              .parse_args(&args)
              .expect("Failed to parse the command line")
              .link_staticlib(&dir, "fuzzbench")
@@ -86,7 +68,7 @@ index 972c99c..dd7ac87 100644
              .expect("Failed to run the wrapped compiler")
          {
 diff --git a/fuzzers/fuzzbench/src/lib.rs b/fuzzers/fuzzbench/src/lib.rs
-index bf4c965..3618deb 100644
+index bf4c965..bb61b82 100644
 --- a/fuzzers/fuzzbench/src/lib.rs
 +++ b/fuzzers/fuzzbench/src/lib.rs
 @@ -1,32 +1,40 @@
@@ -300,7 +282,7 @@ index bf4c965..3618deb 100644
  
      // A minimization+queue policy to get testcasess from the corpus
      let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
-@@ -174,27 +160,39 @@ pub fn main() {
+@@ -174,27 +160,38 @@ pub fn main() {
      // A fuzzer with feedbacks and a corpus scheduler
      let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
  
@@ -320,8 +302,7 @@ index bf4c965..3618deb 100644
 +        ExitKind::Ok
 +    };
  
-+    // Tokens an AutoTokens pass put in this binary (none: libafl_cc.rs runs no
-+    // such pass)
++    // The tokens the AutoTokens pass put in this binary
      let mut tokens = Tokens::new();
 -    let mut executor = ForkserverExecutor::builder()
 -        .program(opt.executable)
@@ -359,7 +340,7 @@ index bf4c965..3618deb 100644
      }
  
      // In case the corpus is empty (on first run), reset
-@@ -207,7 +205,7 @@ pub fn main() {
+@@ -207,7 +204,7 @@ pub fn main() {
                      &corpus_dirs, err
                  )
              });

@@ -11,9 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""unibench's forkserver_libafl, in-process and without AutoTokens. Built as
-libafl_stats builds; run as unibench runs it: -t 5000, no dictionary, no
-jemalloc."""
+"""unibench's forkserver_libafl, in-process. Built as libafl_stats builds;
+run as unibench runs it: -t 5000, no dictionary, no jemalloc."""
 import os
 import subprocess
 import threading

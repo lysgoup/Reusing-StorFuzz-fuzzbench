@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The LibAFL fuzzer unibench's forkserver_libafl arm runs, changed from
-# forkserver to in-process and without the AutoTokens pass
-# (libafl_ubconfig.patch). Same LibAFL commit and
+# The LibAFL fuzzer unibench's forkserver_libafl arm runs, changed only from
+# forkserver to in-process (libafl_ubconfig.patch). Same LibAFL commit and
 # unibench patches; built in fuzzers/fuzzbench, the crate whose staticlib a
 # libFuzzer-style benchmark links, with the Cargo.lock of unibench's build.
 
