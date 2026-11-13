@@ -24,7 +24,10 @@ to src/lib.rs is therefore the complete difference from that fuzzer:
                child's did; the logger (the reusing stage's counters), the
                monitor and the fuzzer's own messages write to a copy of stdout
   - CLI        no target executable, target arguments, --debug-child or
-               --signal; libafl_main() is the entry the target's main calls
+               --signal; libafl_main() is the entry the target's main calls.
+               Files as the only arguments run once each, libFuzzer's
+               convention, which a benchmark build may use to check its
+               binaries (curl's make check)
 
 Cargo.toml and src/bin/libafl_cc.rs take the unibench reusing crate's
 instrumentation and dependencies: trace-pc-guard and AutoTokens only (no
@@ -77,7 +80,7 @@ index 972c99c..dede114 100644
              .expect("Failed to run the wrapped compiler")
          {
 diff --git a/fuzzers/fuzzbench/src/lib.rs b/fuzzers/fuzzbench/src/lib.rs
-index 264123e..f693470 100644
+index 264123e..86bd6de 100644
 --- a/fuzzers/fuzzbench/src/lib.rs
 +++ b/fuzzers/fuzzbench/src/lib.rs
 @@ -1,32 +1,40 @@
@@ -88,7 +91,7 @@ index 264123e..f693470 100644
 +use std::{
 +    env,
 +    fs::File,
-+    io::{self, Write},
++    io::{self, Read, Write},
 +    path::PathBuf,
 +};
  
@@ -179,7 +182,7 @@ index 264123e..f693470 100644
      #[arg(
          help = "Output directory for queue and crashes (created if absent)",
          short = 'o',
-@@ -113,9 +89,22 @@ struct Opt {
+@@ -113,9 +89,26 @@ struct Opt {
      reusing_ablation: Option<String>,
  }
  
@@ -190,6 +193,10 @@ index 264123e..f693470 100644
 -    env_logger::init();
 +#[no_mangle]
 +pub extern "C" fn libafl_main() {
++    if run_testcases_if_given() {
++        return;
++    }
++
 +    // The logger and the monitor write to a copy of stdout; stdout and stderr
 +    // themselves go to /dev/null below, as the forkserver fuzzer's child
 +    // output did. The logger carries the reusing stage's counters.
@@ -204,7 +211,7 @@ index 264123e..f693470 100644
  
      // The harness launches this as a shell background job, which starts it
      // with SIGINT and SIGQUIT ignored; SimpleEventManager installs nothing, so
-@@ -125,7 +114,6 @@ pub fn main() {
+@@ -125,7 +118,6 @@ pub fn main() {
      unsafe { setup_signal_handler(addr_of_mut!(EVENTMGR_SIGHANDLER_STATE)) }
          .expect("Failed to install the shutdown signal handler");
  
@@ -212,7 +219,7 @@ index 264123e..f693470 100644
      let opt = Opt::parse();
  
      let corpus_dirs: Vec<PathBuf> = [opt.in_dir].to_vec();
-@@ -135,18 +123,29 @@ pub fn main() {
+@@ -135,18 +127,29 @@ pub fn main() {
      std::fs::create_dir_all(&queue_dir).expect("Failed to create queue dir");
      std::fs::create_dir_all(&crashes_dir).expect("Failed to create crashes dir");
  
@@ -251,7 +258,7 @@ index 264123e..f693470 100644
      };
  
      // Create an observation channel to keep track of the execution time
-@@ -164,30 +163,19 @@ pub fn main() {
+@@ -164,30 +167,19 @@ pub fn main() {
          MaxMapFeedback::with_name("mapfeedback_metadata_objective", &edges_observer)
      );
  
@@ -295,7 +302,7 @@ index 264123e..f693470 100644
  
      // A minimization+queue policy to get testcasess from the corpus
      let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
-@@ -195,29 +183,44 @@ pub fn main() {
+@@ -195,29 +187,44 @@ pub fn main() {
      // A fuzzer with feedbacks and a corpus scheduler
      let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
  
@@ -307,14 +314,14 @@ index 264123e..f693470 100644
 +    if libfuzzer_initialize(&args) == -1 {
 +        println!("Warning: LLVMFuzzerInitialize failed with -1");
 +    }
-+
+ 
 +    // The wrapped harness function, calling out to the LLVM-style harness
 +    let mut harness = |input: &BytesInput| {
 +        let target = input.target_bytes();
 +        libfuzzer_test_one_input(target.as_slice());
 +        ExitKind::Ok
 +    };
- 
++
 +    // The tokens the AutoTokens pass put in this binary
      let mut tokens = Tokens::new();
 -    let mut executor = ForkserverExecutor::builder()
@@ -358,7 +365,7 @@ index 264123e..f693470 100644
      // In case the corpus is empty (on first run), reset
      if state.must_load_initial_inputs() {
          state
-@@ -228,7 +231,7 @@ pub fn main() {
+@@ -228,7 +235,7 @@ pub fn main() {
                      &corpus_dirs, err
                  )
              });
@@ -367,7 +374,7 @@ index 264123e..f693470 100644
      }
      
      let signal_dir = queue_dir.join("signal");
-@@ -247,7 +250,12 @@ pub fn main() {
+@@ -247,7 +254,12 @@ pub fn main() {
          // them apart. Loud failure on a missing scan dir for the same reason
          // ReusingStage::new is loud: an arm quietly running without its pool
          // is indistinguishable from the baseline afterwards.
@@ -381,7 +388,7 @@ index 264123e..f693470 100644
          for id in seed_ids {
              state
                  .corpus()
-@@ -294,7 +302,8 @@ pub fn main() {
+@@ -294,7 +306,8 @@ pub fn main() {
          // which arm it really was; the AFL++ arm keeps the same record as
          // reusing_load.log.
          let pool_stats = reusing_stage.pool().stats();
@@ -391,7 +398,7 @@ index 264123e..f693470 100644
              "Reusing pool loaded: {} entries ({} segments, {} patterns), {} unsolved sites, {} malformed lines, ablation={:?}",
              pool_stats.entries,
              pool_stats.segments,
-@@ -302,7 +311,8 @@ pub fn main() {
+@@ -302,7 +315,8 @@ pub fn main() {
              pool_stats.unsolved_sites,
              pool_stats.malformed,
              reusing_stage.ablation()
@@ -401,3 +408,37 @@ index 264123e..f693470 100644
          let mut stages = tuple_list!(
              reusing_stage,
              ReusingEnergyStage::new(StdMutationalStage::new(mutator))
+@@ -319,3 +333,33 @@ pub fn main() {
+             .expect("Error in the fuzzing loop");
+     }
+ }
++
++/// libFuzzer's convention, which some benchmark builds use to check their
++/// binaries (curl's `make check` runs `fuzzer file...`): when every argument
++/// is an existing file, run each once and do not fuzz. Returns whether it did.
++fn run_testcases_if_given() -> bool {
++    let files: Vec<String> = env::args().skip(1).collect();
++    if files.is_empty()
++        || !files
++            .iter()
++            .all(|f| !f.starts_with('-') && std::path::Path::new(f).is_file())
++    {
++        return false;
++    }
++
++    // Call LLVMFuzzerInitialize() if present
++    let args: Vec<String> = env::args().collect();
++    if libfuzzer_initialize(&args) == -1 {
++        println!("Warning: LLVMFuzzerInitialize failed with -1");
++    }
++
++    println!("You are not fuzzing, just executing {} testcases", files.len());
++    for fname in &files {
++        let mut buffer = vec![];
++        File::open(fname)
++            .and_then(|mut file| file.read_to_end(&mut buffer))
++            .expect("Failed to read a testcase");
++        libfuzzer_test_one_input(&buffer);
++    }
++    true
++}

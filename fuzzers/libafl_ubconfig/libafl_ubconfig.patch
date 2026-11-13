@@ -19,7 +19,10 @@ src/lib.rs is therefore the complete difference from that fuzzer:
   - output     the target's stdout/stderr go to /dev/null, as the forkserver
                child's did; the monitor writes to a copy of stdout
   - CLI        no target executable, target arguments, --debug-child or
-               --signal; libafl_main() is the entry the target's main calls
+               --signal; libafl_main() is the entry the target's main calls.
+               Files as the only arguments run once each, libFuzzer's
+               convention, which a benchmark build may use to check its
+               binaries (curl's make check)
 
 Cargo.toml and src/bin/libafl_cc.rs take unibench's instrumentation and the
 unibench crate's dependencies: trace-pc-guard and AutoTokens only (no
@@ -68,7 +71,7 @@ index 972c99c..dede114 100644
              .expect("Failed to run the wrapped compiler")
          {
 diff --git a/fuzzers/fuzzbench/src/lib.rs b/fuzzers/fuzzbench/src/lib.rs
-index bf4c965..bb61b82 100644
+index bf4c965..e7d8cb3 100644
 --- a/fuzzers/fuzzbench/src/lib.rs
 +++ b/fuzzers/fuzzbench/src/lib.rs
 @@ -1,32 +1,40 @@
@@ -79,7 +82,7 @@ index bf4c965..bb61b82 100644
 +use std::{
 +    env,
 +    fs::File,
-+    io::{self, Write},
++    io::{self, Read, Write},
 +    path::PathBuf,
 +};
  
@@ -170,7 +173,7 @@ index bf4c965..bb61b82 100644
      #[arg(
          help = "Output directory for queue and crashes (created if absent)",
          short = 'o',
-@@ -92,8 +68,11 @@ struct Opt {
+@@ -92,8 +68,15 @@ struct Opt {
      output_dir: PathBuf,
  }
  
@@ -180,10 +183,14 @@ index bf4c965..bb61b82 100644
 -pub fn main() {
 +#[no_mangle]
 +pub extern "C" fn libafl_main() {
++    if run_testcases_if_given() {
++        return;
++    }
++
      env_logger::init();
  
      // The harness launches this as a shell background job, which starts it
-@@ -104,7 +83,6 @@ pub fn main() {
+@@ -104,7 +87,6 @@ pub fn main() {
      unsafe { setup_signal_handler(addr_of_mut!(EVENTMGR_SIGHANDLER_STATE)) }
          .expect("Failed to install the shutdown signal handler");
  
@@ -191,7 +198,7 @@ index bf4c965..bb61b82 100644
      let opt = Opt::parse();
  
      let corpus_dirs: Vec<PathBuf> = [opt.in_dir].to_vec();
-@@ -114,18 +92,37 @@ pub fn main() {
+@@ -114,18 +96,37 @@ pub fn main() {
      std::fs::create_dir_all(&queue_dir).expect("Failed to create queue dir");
      std::fs::create_dir_all(&crashes_dir).expect("Failed to create crashes dir");
  
@@ -204,9 +211,15 @@ index bf4c965..bb61b82 100644
 +        File::from_raw_fd(new_fd)
 +    };
 +    let mut log_out = stdout_cpy.try_clone().unwrap();
-+
+ 
+-    // The coverage map shared between observer and executor
+-    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
+-    // let the forkserver know the shmid
+-    shmem.write_to_env("__AFL_SHM_ID").unwrap();
+-    let shmem_buf = shmem.as_slice_mut();
 +    let stats_file = opt.output_dir.join("stats.toml");
-+
+ 
+-    // Create an observation channel using the signals map
 +    // The Monitor trait define how the fuzzer stats are reported to the user
 +    let monitor = OnDiskTOMLMonitor::new(
 +        &stats_file,
@@ -214,12 +227,7 @@ index bf4c965..bb61b82 100644
 +            writeln!(stdout_cpy, "{s}").unwrap();
 +        }),
 +    );
- 
--    // The coverage map shared between observer and executor
--    let mut shmem = shmem_provider.new_shmem(MAP_SIZE).unwrap();
--    // let the forkserver know the shmid
--    shmem.write_to_env("__AFL_SHM_ID").unwrap();
--    let shmem_buf = shmem.as_slice_mut();
++
 +    // The target runs in this process: a crash restarts the fuzzer from the
 +    // state it left in shared memory
 +    let mut shmem_provider = StdShMemProvider::new().unwrap();
@@ -229,8 +237,7 @@ index bf4c965..bb61b82 100644
 +        Err(Error::ShuttingDown) => return,
 +        Err(err) => panic!("Failed to setup the restarter: {err}"),
 +    };
- 
--    // Create an observation channel using the signals map
++
 +    // Create an observation channel using the in-process edges map
      let edges_observer = unsafe {
 -        HitcountsMapObserver::new(StdMapObserver::new("shared_mem", shmem_buf)).track_indices()
@@ -238,7 +245,7 @@ index bf4c965..bb61b82 100644
      };
  
      // Create an observation channel to keep track of the execution time
-@@ -143,30 +140,19 @@ pub fn main() {
+@@ -143,30 +144,19 @@ pub fn main() {
          MaxMapFeedback::with_name("mapfeedback_metadata_objective", &edges_observer)
      );
  
@@ -282,7 +289,7 @@ index bf4c965..bb61b82 100644
  
      // A minimization+queue policy to get testcasess from the corpus
      let scheduler = IndexesLenTimeMinimizerScheduler::new(&edges_observer, QueueScheduler::new());
-@@ -174,27 +160,38 @@ pub fn main() {
+@@ -174,27 +164,38 @@ pub fn main() {
      // A fuzzer with feedbacks and a corpus scheduler
      let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
  
@@ -294,14 +301,14 @@ index bf4c965..bb61b82 100644
 +    if libfuzzer_initialize(&args) == -1 {
 +        println!("Warning: LLVMFuzzerInitialize failed with -1");
 +    }
-+
+ 
 +    // The wrapped harness function, calling out to the LLVM-style harness
 +    let mut harness = |input: &BytesInput| {
 +        let target = input.target_bytes();
 +        libfuzzer_test_one_input(target.as_slice());
 +        ExitKind::Ok
 +    };
- 
++
 +    // The tokens the AutoTokens pass put in this binary
      let mut tokens = Tokens::new();
 -    let mut executor = ForkserverExecutor::builder()
@@ -340,7 +347,7 @@ index bf4c965..bb61b82 100644
      }
  
      // In case the corpus is empty (on first run), reset
-@@ -207,7 +204,7 @@ pub fn main() {
+@@ -207,7 +208,7 @@ pub fn main() {
                      &corpus_dirs, err
                  )
              });
@@ -349,3 +356,37 @@ index bf4c965..bb61b82 100644
      }
      
      let signal_dir = queue_dir.join("signal");
+@@ -225,3 +226,33 @@ pub fn main() {
+         .fuzz_loop(&mut stages, &mut executor, &mut state, &mut mgr)
+         .expect("Error in the fuzzing loop");
+ }
++
++/// libFuzzer's convention, which some benchmark builds use to check their
++/// binaries (curl's `make check` runs `fuzzer file...`): when every argument
++/// is an existing file, run each once and do not fuzz. Returns whether it did.
++fn run_testcases_if_given() -> bool {
++    let files: Vec<String> = env::args().skip(1).collect();
++    if files.is_empty()
++        || !files
++            .iter()
++            .all(|f| !f.starts_with('-') && std::path::Path::new(f).is_file())
++    {
++        return false;
++    }
++
++    // Call LLVMFuzzerInitialize() if present
++    let args: Vec<String> = env::args().collect();
++    if libfuzzer_initialize(&args) == -1 {
++        println!("Warning: LLVMFuzzerInitialize failed with -1");
++    }
++
++    println!("You are not fuzzing, just executing {} testcases", files.len());
++    for fname in &files {
++        let mut buffer = vec![];
++        File::open(fname)
++            .and_then(|mut file| file.read_to_end(&mut buffer))
++            .expect("Failed to read a testcase");
++        libfuzzer_test_one_input(&buffer);
++    }
++    true
++}
