@@ -49,7 +49,7 @@ ENV PATH="/root/.cargo/bin:$PATH"
 
 # Pinned: the scan output must come from a known scanner, the way the
 # unibench workdirs name theirs (..._scanner-90986c8_...).
-ARG SCANNER_COMMIT=90986c8aeb997a5333bfbc7cfd2822d0f3feb909
+ARG SCANNER_COMMIT=5c3e6da0ba0b5b88931c51b7419d4e4601489085
 RUN git clone https://github.com/lysgoup/Reusing_scanner.git /scanner_src && \
     git -C /scanner_src checkout ${SCANNER_COMMIT}
 
