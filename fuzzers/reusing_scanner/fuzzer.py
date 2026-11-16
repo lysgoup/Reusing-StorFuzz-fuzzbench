@@ -138,7 +138,7 @@ def build():
     # not trip on already-existing paths (e.g. mkdir /out/seeds/).
     for item in os.listdir(out):
         if item in out_before or item in (fuzz_target + '.fast',
-                                          'cmpid_fast.txt'):
+                                          'cmpid_fast.txt', 'cmpid_fast.map'):
             continue
         item_path = os.path.join(out, item)
         if os.path.isdir(item_path):
@@ -167,6 +167,11 @@ def build():
             os.rename(lib + '.bak', lib)
     shutil.move(os.path.join(out, fuzz_target),
                 os.path.join(out, fuzz_target + '.taint'))
+    # The pass's cmpid -> source map of the taint build, where taint_scan
+    # looks for it (beside the track binary) to write the scan's
+    # cmpid_map.tsv.
+    shutil.move(os.path.join(out, 'cmpid_track.map'),
+                os.path.join(out, fuzz_target + '.taint.cmpid.map'))
 
     shutil.copy(f'{SCANNER_BIN}/taint_scan', os.path.join(out, 'taint_scan'))
     shutil.copy(ABILIST_PATH, os.path.join(out, 'reusing_scanner_abilist.txt'))
