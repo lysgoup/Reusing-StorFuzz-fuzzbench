@@ -360,6 +360,13 @@ def extract_corpus(corpus_archive: str, output_directory: str):
                 # So skip if not a file.
                 continue
 
+            if os.path.basename(member.name).startswith('.'):
+                # A fuzzer's own bookkeeping, not a corpus element: LibAFL's
+                # .<name>.metadata (JSON) and .<name>.lafl_lock beside each
+                # queue entry. Run as inputs, they would add the coverage of
+                # parsing JSON to the fuzzers that write them.
+                continue
+
             member_file_handle = tar.extractfile(member)
             if not member_file_handle:
                 logger.info('Failed to get handle to %s.', member)
